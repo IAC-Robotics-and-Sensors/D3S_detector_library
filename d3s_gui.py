@@ -1,201 +1,775 @@
 """
 D3S Detector GUI
 ================
-Tkinter + Matplotlib GUI for D3SController.
+
+PyQt6 + Matplotlib GUI for the D3SController.
+
+Features:
+ - Connect / Disconnect
+ - Start / Stop / Reset spectrum acquisition
+ - Save current spectrum
+ - Fixed-duration (timed) acquisition
+ - Periodic logging (interval + total time)
+ - Live plot with CPS, neutron count, and delta_t display
+ - Log scale toggle
+ - Energy calibration (channel → keV) via interactive marker placement
+ - Calibration save / load (JSON)
+ - Temperature reading
+ - Serial number display
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from __future__ import annotations
+
+import json
+import sys
 import threading
 import time
+from datetime import datetime
+
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QStatusBar,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 from d3s_controller import D3SController
 
 
-class D3SGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("D3S Detector Control")
-        self.root.geometry("950x750")
+class MainWindow(QMainWindow):
+    """Primary application window for the Kromek D3S detector."""
+
+    log_signal = pyqtSignal(str)  # thread-safe logging
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Kromek D3S — Radiation Detector")
+        self.resize(1100, 750)
 
         self.controller = D3SController(verbose=True)
-        self.running = False
-        self._shutdown = False
-        self.update_thread = None
+        self._acquiring = False
 
-        self._setup_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Calibration state
+        self._cal_markers: list[dict] = []   # [{"channel": int, "energy": float}, ...]
+        self._cal_poly: np.poly1d | None = None
+        self._cal_applied = False
+        self._pick_mode = False
+        self._marker_lines: list = []  # matplotlib Line2D vertical markers
 
-    # --------------------------------------------------------
-    # UI SETUP
-    # --------------------------------------------------------
+        self._build_ui()
+        self._connect_signals()
 
-    def _setup_ui(self):
-        frame = ttk.Frame(self.root, padding=10)
-        frame.pack(side=tk.TOP, fill=tk.X)
+        # Periodic UI refresh (10 Hz)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
 
-        ttk.Button(frame, text="Start", command=self.start).pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame, text="Stop", command=self.stop).pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame, text="Reset", command=self.controller.reset).pack(side=tk.LEFT, padx=5)
-        ttk.Button(frame, text="Save Spectrum", command=self.save_spectrum).pack(side=tk.LEFT, padx=5)
+        self.log_signal.connect(self._append_log)
 
-        # Timed acquisition
-        ttk.Label(frame, text="Acquire Duration (s):").pack(side=tk.LEFT, padx=5)
-        self.acquire_time_var = tk.StringVar(value="10")
-        ttk.Entry(frame, width=6, textvariable=self.acquire_time_var).pack(side=tk.LEFT)
-        ttk.Button(frame, text="Acquire Fixed Spectrum", command=self.acquire_fixed_spectrum).pack(side=tk.LEFT, padx=5)
+        self._set_controls_enabled(False)
 
-        # Logging controls
-        log_frame = ttk.LabelFrame(self.root, text="Periodic Logging", padding=10)
-        log_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+    # ── UI construction ──────────────────────────────────────────────────────
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-        ttk.Label(log_frame, text="Interval (s):").pack(side=tk.LEFT, padx=5)
-        self.interval_var = tk.StringVar(value="10")
-        ttk.Entry(log_frame, width=6, textvariable=self.interval_var).pack(side=tk.LEFT)
+        # ── top toolbar ──────────────────────────────────────────────────────
+        toolbar = QHBoxLayout()
+        self.btn_connect = QPushButton("Connect")
+        self.btn_disconnect = QPushButton("Disconnect")
+        self.btn_disconnect.setEnabled(False)
+        toolbar.addWidget(self.btn_connect)
+        toolbar.addWidget(self.btn_disconnect)
+        toolbar.addStretch()
+        self.lbl_status = QLabel("Disconnected")
+        toolbar.addWidget(self.lbl_status)
+        root.addLayout(toolbar)
 
-        ttk.Label(log_frame, text="Total Time (s, 0 = continuous):").pack(side=tk.LEFT, padx=5)
-        self.total_var = tk.StringVar(value="0")
-        ttk.Entry(log_frame, width=6, textvariable=self.total_var).pack(side=tk.LEFT)
+        # ── tabs ─────────────────────────────────────────────────────────────
+        tabs = QTabWidget()
+        root.addWidget(tabs)
 
-        ttk.Button(log_frame, text="Start Logging", command=self.start_logging).pack(side=tk.LEFT, padx=5)
-        ttk.Button(log_frame, text="Stop Logging", command=self.stop_logging).pack(side=tk.LEFT, padx=5)
+        # --- Spectrum tab ---
+        spectrum_tab = QWidget()
+        tabs.addTab(spectrum_tab, "Spectrum")
+        self._build_spectrum_tab(spectrum_tab)
 
-        # Matplotlib plot
-        fig, ax = plt.subplots(figsize=(8, 5))
-        self.fig, self.ax = fig, ax
-        self.ax.set_title("D3S Live Spectrum")
+        # --- Acquisition tab ---
+        acq_tab = QWidget()
+        tabs.addTab(acq_tab, "Acquisition")
+        self._build_acquisition_tab(acq_tab)
+
+        # --- Calibration tab ---
+        cal_tab = QWidget()
+        tabs.addTab(cal_tab, "Calibration")
+        self._build_calibration_tab(cal_tab)
+
+        # --- Device Info tab ---
+        info_tab = QWidget()
+        tabs.addTab(info_tab, "Device Info")
+        self._build_device_info_tab(info_tab)
+
+        # ── log area ─────────────────────────────────────────────────────────
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(120)
+        root.addWidget(self.log_box)
+
+        self.setStatusBar(QStatusBar())
+
+    # -- Spectrum tab --------------------------------------------------------
+    def _build_spectrum_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
+
+        # Matplotlib canvas
+        self.fig = Figure(figsize=(9, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel("Channel")
         self.ax.set_ylabel("Counts")
-        self.line, = self.ax.plot(np.arange(4096), np.zeros(4096), color="blue")
-        self.canvas = FigureCanvasTkAgg(fig, master=self.root)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.ax.set_title("D3S Live Spectrum")
+        self.canvas = FigureCanvas(self.fig)
+        lay.addWidget(self.canvas)
+        self._line = None  # will hold the plot Line2D
 
-        self.status = tk.StringVar(value="Ready")
-        ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN, anchor="w").pack(side=tk.BOTTOM, fill=tk.X)
+        # Controls row
+        ctrl = QHBoxLayout()
+        self.btn_start = QPushButton("Start Acquisition")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_clear = QPushButton("Clear Spectrum")
+        self.btn_save = QPushButton("Save Spectrum")
+        self.chk_log_scale = QCheckBox("Log scale")
+        ctrl.addWidget(self.btn_start)
+        ctrl.addWidget(self.btn_stop)
+        ctrl.addWidget(self.btn_clear)
+        ctrl.addWidget(self.btn_save)
+        ctrl.addWidget(self.chk_log_scale)
+        ctrl.addStretch()
 
-    # --------------------------------------------------------
-    # CORE CONTROLS
-    # --------------------------------------------------------
+        # Info labels
+        self.lbl_counts = QLabel("Counts: 0")
+        self.lbl_cps = QLabel("CPS: 0")
+        self.lbl_neutrons = QLabel("Neutrons: 0")
+        self.lbl_elapsed = QLabel("Time: 0 s")
+        ctrl.addWidget(self.lbl_counts)
+        ctrl.addWidget(self.lbl_cps)
+        ctrl.addWidget(self.lbl_neutrons)
+        ctrl.addWidget(self.lbl_elapsed)
 
-    def start(self):
-        self.controller.start()
-        time.sleep(0.1)  # Give time to start
-        self.controller.reset()
-        if not self.running:
-            self.running = True
-            self.update_thread = threading.Thread(target=self._update_loop)
-            self.update_thread.start()
-        self.status.set("Acquisition started.")
+        lay.addLayout(ctrl)
 
-    def stop(self):
-        self.running = False
-        self.controller.stop()
-        self.status.set("Stopped.")
+    # -- Acquisition tab -----------------------------------------------------
+    def _build_acquisition_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
 
-    def save_spectrum(self):
-        filename = filedialog.asksaveasfilename(defaultextension=".txt")
-        if filename:
-            self.controller.save_spectrum(filename)
-            messagebox.showinfo("Saved", f"Spectrum saved to:\n{filename}")
+        # Timed acquisition
+        grp_timed = QGroupBox("Timed Acquisition")
+        g1 = QHBoxLayout(grp_timed)
+        g1.addWidget(QLabel("Duration (s):"))
+        self.spin_acq_duration = QSpinBox()
+        self.spin_acq_duration.setRange(1, 100000)
+        self.spin_acq_duration.setValue(10)
+        self.spin_acq_duration.setSuffix(" s")
+        g1.addWidget(self.spin_acq_duration)
+        self.btn_acquire_fixed = QPushButton("Acquire Fixed Spectrum")
+        g1.addWidget(self.btn_acquire_fixed)
+        g1.addStretch()
+        lay.addWidget(grp_timed)
 
-    def acquire_fixed_spectrum(self):
-        try:
-            duration = float(self.acquire_time_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid duration.")
-            return
-        filename = filedialog.asksaveasfilename(defaultextension=".txt", title="Save acquired spectrum")
-        if not filename:
-            return
+        # Periodic logging
+        grp_log = QGroupBox("Periodic Logging")
+        g2 = QHBoxLayout(grp_log)
+        g2.addWidget(QLabel("Interval (s):"))
+        self.spin_log_interval = QSpinBox()
+        self.spin_log_interval.setRange(1, 100000)
+        self.spin_log_interval.setValue(10)
+        self.spin_log_interval.setSuffix(" s")
+        g2.addWidget(self.spin_log_interval)
+        g2.addWidget(QLabel("Total (s, 0 = continuous):"))
+        self.spin_log_total = QSpinBox()
+        self.spin_log_total.setRange(0, 1000000)
+        self.spin_log_total.setValue(0)
+        self.spin_log_total.setSuffix(" s")
+        g2.addWidget(self.spin_log_total)
+        self.btn_start_logging = QPushButton("Start Logging")
+        self.btn_stop_logging = QPushButton("Stop Logging")
+        g2.addWidget(self.btn_start_logging)
+        g2.addWidget(self.btn_stop_logging)
+        g2.addStretch()
+        lay.addWidget(grp_log)
 
-        # Reset the spectrum display before acquisition
-        self.controller.reset()
-        self.update_plot(np.zeros(4096))
-        self.status.set(f"Acquiring for {duration}s...")
+        lay.addStretch()
 
-        threading.Thread(
-            target=self._acquire_fixed_thread,
-            args=(duration, filename),
-            daemon=True,
-        ).start()
+    # -- Calibration tab ------------------------------------------------------
+    def _build_calibration_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
 
-    def _acquire_fixed_thread(self, duration, filename):
-        spec, elapsed = self.controller.acquire_spectrum_for_duration(duration, filename)
-        messagebox.showinfo("Saved", f"Spectrum acquired ({elapsed:.1f}s) and saved to:\n{filename}")
-        self.status.set(f"Timed spectrum saved ({elapsed:.1f}s)")
+        # ── marker picking ───────────────────────────────────────────────────
+        grp_pick = QGroupBox("Marker Placement")
+        gp = QHBoxLayout(grp_pick)
+        self.chk_pick_mode = QCheckBox("Enable marker picking (click on spectrum)")
+        gp.addWidget(self.chk_pick_mode)
+        gp.addStretch()
+        lay.addWidget(grp_pick)
 
-    # --------------------------------------------------------
-    # LOGGING
-    # --------------------------------------------------------
+        # ── calibration points table ─────────────────────────────────────────
+        grp_table = QGroupBox("Calibration Points")
+        gt = QVBoxLayout(grp_table)
+        self.cal_table = QTableWidget(0, 2)
+        self.cal_table.setHorizontalHeaderLabels(["Channel", "Energy (keV)"])
+        self.cal_table.horizontalHeader().setStretchLastSection(True)
+        self.cal_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.cal_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        gt.addWidget(self.cal_table)
 
+        tbl_btns = QHBoxLayout()
+        self.btn_remove_marker = QPushButton("Remove Selected")
+        self.btn_clear_markers = QPushButton("Clear Markers")
+        self.btn_clear_all_cal = QPushButton("Clear All (incl. calibration)")
+        self.btn_clear_all_cal.setStyleSheet("color: red;")
+        tbl_btns.addWidget(self.btn_remove_marker)
+        tbl_btns.addWidget(self.btn_clear_markers)
+        tbl_btns.addWidget(self.btn_clear_all_cal)
+        tbl_btns.addStretch()
+        gt.addLayout(tbl_btns)
+        lay.addWidget(grp_table)
 
-    def start_logging(self):
-        try:
-            interval = float(self.interval_var.get())
-            total = float(self.total_var.get())
-        except ValueError:
-            messagebox.showerror("Error", "Invalid interval or total time.")
-            return
-        filename = filedialog.asksaveasfilename(defaultextension=".csv", title="Base filename for logging")
-        if not filename:
-            return
+        # ── polynomial fit ───────────────────────────────────────────────────
+        grp_fit = QGroupBox("Polynomial Fit")
+        gf = QHBoxLayout(grp_fit)
+        gf.addWidget(QLabel("Polynomial order:"))
+        self.spin_poly_order = QSpinBox()
+        self.spin_poly_order.setRange(1, 5)
+        self.spin_poly_order.setValue(1)
+        gf.addWidget(self.spin_poly_order)
+        self.btn_fit_cal = QPushButton("Fit")
+        gf.addWidget(self.btn_fit_cal)
+        self.chk_apply_cal = QCheckBox("Apply calibration to plot")
+        gf.addWidget(self.chk_apply_cal)
+        gf.addStretch()
+        lay.addWidget(grp_fit)
 
-        # Reset display and spectrum before starting logging
-        self.controller.reset()
-        self.update_plot(np.zeros(4096))
-        self.controller.start_periodic_logging(filename, interval, total)
-        self.status.set(f"Logging started ({interval}s interval)")
+        # ── coefficients display ─────────────────────────────────────────────
+        grp_coeff = QGroupBox("Calibration Coefficients")
+        gc = QVBoxLayout(grp_coeff)
+        self.lbl_cal_coeffs = QLabel("No calibration computed yet.")
+        self.lbl_cal_coeffs.setWordWrap(True)
+        gc.addWidget(self.lbl_cal_coeffs)
+        lay.addWidget(grp_coeff)
 
-    def stop_logging(self):
-        self.controller.stop_periodic_logging()
-        self.status.set("Logging stopped")
+        # ── save / load ──────────────────────────────────────────────────────
+        grp_io = QGroupBox("Save / Load")
+        gio = QHBoxLayout(grp_io)
+        self.btn_save_cal = QPushButton("Save Calibration\u2026")
+        self.btn_load_cal = QPushButton("Load Calibration\u2026")
+        gio.addWidget(self.btn_save_cal)
+        gio.addWidget(self.btn_load_cal)
+        gio.addStretch()
+        lay.addWidget(grp_io)
 
-    # --------------------------------------------------------
-    # UPDATE LOOP
-    # --------------------------------------------------------
+        lay.addStretch()
 
-    def _update_loop(self):
-        while self.running and not self._shutdown:
-            spectrum, elapsed, cps = self.controller.get_spectrum()
-            self.update_plot(spectrum)
-            # Display CPS and Δt if logging active
-            delta_t = self.controller.last_delta_t
-            if delta_t:
-                self.status.set(f"Elapsed: {elapsed:.1f}s | CPS: {cps:.1f} | Δt: {delta_t:.2f}s")
-            else:
-                self.status.set(f"Elapsed: {elapsed:.1f}s | CPS: {cps:.1f}")
-            time.sleep(0.25)
-        print("Update thread exited cleanly.")
+    # -- Device Info tab -----------------------------------------------------
+    def _build_device_info_tab(self, parent: QWidget):
+        lay = QVBoxLayout(parent)
 
-    def update_plot(self, spectrum):
-        self.line.set_ydata(spectrum)
-        self.ax.relim()
-        self.ax.autoscale_view(True, True, True)
+        grp_info = QGroupBox("Device Information")
+        gi = QVBoxLayout(grp_info)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Serial Number:"))
+        self.lbl_serial = QLabel("\u2014")
+        row1.addWidget(self.lbl_serial)
+        row1.addStretch()
+        gi.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Temperature:"))
+        self.lbl_device_temp = QLabel("\u2014 \u00b0C")
+        row2.addWidget(self.lbl_device_temp)
+        self.btn_read_temp = QPushButton("Read Temperature")
+        row2.addWidget(self.btn_read_temp)
+        row2.addStretch()
+        gi.addLayout(row2)
+
+        lay.addWidget(grp_info)
+        lay.addStretch()
+
+    # ── signal wiring ────────────────────────────────────────────────────────
+    def _connect_signals(self):
+        self.btn_connect.clicked.connect(self._on_connect)
+        self.btn_disconnect.clicked.connect(self._on_disconnect)
+
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_clear.clicked.connect(self._on_clear)
+        self.btn_save.clicked.connect(self._on_save)
+        self.chk_log_scale.stateChanged.connect(self._on_log_scale)
+
+        self.btn_acquire_fixed.clicked.connect(self._on_acquire_fixed)
+        self.btn_start_logging.clicked.connect(self._on_start_logging)
+        self.btn_stop_logging.clicked.connect(self._on_stop_logging)
+
+        self.btn_read_temp.clicked.connect(self._on_read_temp)
+
+        # Calibration signals
+        self.chk_pick_mode.stateChanged.connect(self._on_pick_mode_toggled)
+        self.btn_remove_marker.clicked.connect(self._on_remove_marker)
+        self.btn_clear_markers.clicked.connect(self._on_clear_markers)
+        self.btn_clear_all_cal.clicked.connect(self._on_clear_all_cal)
+        self.btn_fit_cal.clicked.connect(self._on_fit_calibration)
+        self.chk_apply_cal.stateChanged.connect(self._on_apply_calibration)
+        self.btn_save_cal.clicked.connect(self._on_save_calibration)
+        self.btn_load_cal.clicked.connect(self._on_load_calibration)
+        self.cal_table.cellChanged.connect(self._on_cal_table_edited)
+
+        # Matplotlib pick event
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _set_controls_enabled(self, on: bool):
+        for w in (
+            self.btn_start,
+            self.btn_stop,
+            self.btn_clear,
+            self.btn_save,
+            self.btn_acquire_fixed,
+            self.btn_start_logging,
+            self.btn_stop_logging,
+            self.btn_read_temp,
+        ):
+            w.setEnabled(on)
+
+    def _log(self, msg: str):
+        self.log_signal.emit(msg)
+
+    @pyqtSlot(str)
+    def _append_log(self, msg: str):
+        self.log_box.append(msg)
+
+    # ── calibration helpers ──────────────────────────────────────────────────
+    def _sync_table_to_markers(self):
+        """Rebuild the QTableWidget rows from *self._cal_markers*."""
+        self.cal_table.blockSignals(True)
+        self.cal_table.setRowCount(len(self._cal_markers))
+        for row, m in enumerate(self._cal_markers):
+            ch_item = QTableWidgetItem(str(m["channel"]))
+            ch_item.setFlags(ch_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.cal_table.setItem(row, 0, ch_item)
+            en_item = QTableWidgetItem(f"{m['energy']:.2f}")
+            self.cal_table.setItem(row, 1, en_item)
+        self.cal_table.blockSignals(False)
+
+    def _update_marker_lines(self):
+        """Draw vertical lines on the spectrum for each calibration marker."""
+        for ln in self._marker_lines:
+            ln.remove()
+        self._marker_lines.clear()
+
+        for m in self._cal_markers:
+            xval = m["channel"]
+            if self._cal_applied and self._cal_poly is not None:
+                xval = float(self._cal_poly(m["channel"]))
+            ln = self.ax.axvline(
+                xval, color="red", linestyle="--", linewidth=0.9, alpha=0.7
+            )
+            self._marker_lines.append(ln)
         self.canvas.draw_idle()
 
-    # --------------------------------------------------------
-    # SHUTDOWN
-    # --------------------------------------------------------
+    def _rebuild_plot_xaxis(self):
+        """Switch x-axis between channels and calibrated energy."""
+        if self._line is None:
+            return
+        n = len(self._line.get_ydata())
+        if self._cal_applied and self._cal_poly is not None:
+            x = self._cal_poly(np.arange(n))
+            self.ax.set_xlabel("Energy (keV)")
+        else:
+            x = np.arange(n, dtype=float)
+            self.ax.set_xlabel("Channel")
+        self._line.set_xdata(x)
+        self.ax.set_xlim(x.min(), x.max())
+        self._update_marker_lines()
+        self.canvas.draw_idle()
 
-    def on_close(self):
-        """Clean shutdown of GUI and controller."""
-        if messagebox.askokcancel("Quit", "Are you sure you want to exit?"):
-            self._shutdown = True
-            self.status.set("Closing...")
-            try:
-                self.stop()
-            except Exception as e:
-                print(f"Error stopping: {e}")
-            time.sleep(0.5)
-            self.root.quit()
-            self.root.destroy()
-            print("GUI closed cleanly.")
+    # ── calibration slots ────────────────────────────────────────────────────
+    def _on_pick_mode_toggled(self, state):
+        self._pick_mode = bool(state)
+        if self._pick_mode:
+            self._log("Marker pick mode ON \u2014 click on spectrum to place markers.")
+        else:
+            self._log("Marker pick mode OFF.")
+
+    def _on_canvas_click(self, event):
+        """Handle matplotlib click — add a calibration marker."""
+        if not self._pick_mode:
+            return
+        if event.inaxes != self.ax:
+            return
+        if event.button != 1:  # left-click only
+            return
+
+        # Determine channel from click position
+        if self._cal_applied and self._cal_poly is not None:
+            n = 4096
+            energies = self._cal_poly(np.arange(n))
+            channel = int(np.argmin(np.abs(energies - event.xdata)))
+        else:
+            channel = int(round(event.xdata))
+        channel = max(0, min(channel, 4095))
+
+        # Avoid duplicate channels
+        if any(m["channel"] == channel for m in self._cal_markers):
+            self._log(f"Channel {channel} already has a marker.")
+            return
+
+        self._cal_markers.append({"channel": channel, "energy": 0.0})
+        self._cal_markers.sort(key=lambda m: m["channel"])
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Marker added at channel {channel}. Enter its energy in the table.")
+
+    def _on_cal_table_edited(self, row, col):
+        """User edited an energy value in the calibration table."""
+        if col != 1:
+            return
+        item = self.cal_table.item(row, col)
+        if item is None:
+            return
+        try:
+            energy = float(item.text())
+        except ValueError:
+            self._log(f"Invalid energy value: {item.text()!r}")
+            return
+        if 0 <= row < len(self._cal_markers):
+            self._cal_markers[row]["energy"] = energy
+
+    def _on_remove_marker(self):
+        rows = sorted(
+            {idx.row() for idx in self.cal_table.selectedIndexes()}, reverse=True
+        )
+        if not rows:
+            return
+        for r in rows:
+            if 0 <= r < len(self._cal_markers):
+                del self._cal_markers[r]
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Removed {len(rows)} marker(s).")
+
+    def _on_clear_markers(self):
+        """Remove all markers but keep the current calibration polynomial."""
+        self._cal_markers.clear()
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log("Markers cleared (calibration retained).")
+
+    def _on_clear_all_cal(self):
+        """Remove markers *and* reset the calibration polynomial."""
+        self._cal_markers.clear()
+        self._cal_poly = None
+        self._cal_applied = False
+        self.chk_apply_cal.setChecked(False)
+        self.lbl_cal_coeffs.setText("No calibration computed yet.")
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._rebuild_plot_xaxis()
+        self._log("All calibration markers and fit cleared.")
+
+    def _on_fit_calibration(self):
+        order = self.spin_poly_order.value()
+        pts = [
+            (m["channel"], m["energy"])
+            for m in self._cal_markers
+            if m["energy"] != 0.0
+        ]
+        if len(pts) < order + 1:
+            QMessageBox.warning(
+                self,
+                "Calibration",
+                f"Need at least {order + 1} points with non-zero energies for a "
+                f"degree-{order} polynomial (have {len(pts)}).",
+            )
+            return
+        channels = np.array([p[0] for p in pts], dtype=float)
+        energies = np.array([p[1] for p in pts], dtype=float)
+        coeffs = np.polyfit(channels, energies, order)
+        self._cal_poly = np.poly1d(coeffs)
+
+        # Build display string
+        terms = []
+        for i, c in enumerate(coeffs):
+            power = order - i
+            if power == 0:
+                terms.append(f"{c:+.6g}")
+            elif power == 1:
+                terms.append(f"{c:+.6g}\u00b7ch")
+            else:
+                terms.append(f"{c:+.6g}\u00b7ch^{power}")
+        eqn = "E(ch) = " + " ".join(terms)
+        self.lbl_cal_coeffs.setText(eqn)
+        self._log(f"Calibration fit (order {order}): {eqn}")
+
+        # If calibration is already applied, refresh
+        if self._cal_applied:
+            self._rebuild_plot_xaxis()
+
+    def _on_apply_calibration(self, state):
+        if state and self._cal_poly is None:
+            QMessageBox.warning(self, "Calibration", "Compute a fit first.")
+            self.chk_apply_cal.setChecked(False)
+            return
+        self._cal_applied = bool(state)
+        self._rebuild_plot_xaxis()
+        if self._cal_applied:
+            self._log("Calibration applied \u2014 x-axis now shows energy (keV).")
+        else:
+            self._log("Calibration removed \u2014 x-axis shows channels.")
+
+    def _on_save_calibration(self):
+        default_name = f"d3s_calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Calibration", default_name, "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        data = {
+            "markers": self._cal_markers,
+            "poly_order": self.spin_poly_order.value(),
+            "coefficients": list(self._cal_poly.coeffs) if self._cal_poly else None,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        self._log(f"Calibration saved to {path}")
+
+    def _on_load_calibration(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration", "", "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        with open(path) as f:
+            data = json.load(f)
+        self._cal_markers = data.get("markers", [])
+        order = data.get("poly_order", 1)
+        self.spin_poly_order.setValue(order)
+        coeffs = data.get("coefficients")
+        if coeffs is not None:
+            self._cal_poly = np.poly1d(coeffs)
+            deg = len(coeffs) - 1
+            terms = []
+            for i, c in enumerate(coeffs):
+                power = deg - i
+                if power == 0:
+                    terms.append(f"{c:+.6g}")
+                elif power == 1:
+                    terms.append(f"{c:+.6g}\u00b7ch")
+                else:
+                    terms.append(f"{c:+.6g}\u00b7ch^{power}")
+            self.lbl_cal_coeffs.setText("E(ch) = " + " ".join(terms))
+        else:
+            self._cal_poly = None
+            self.lbl_cal_coeffs.setText("No calibration computed yet.")
+        self._sync_table_to_markers()
+        self._update_marker_lines()
+        self._log(f"Calibration loaded from {path}")
+
+    # ── connection slots ─────────────────────────────────────────────────────
+    def _on_connect(self):
+        self._log("Connecting to D3S...")
+        if self.controller.connect():
+            sn = self.controller.serial_number
+            self.lbl_status.setText(f"Connected (S/N: {sn})")
+            self.lbl_serial.setText(sn or "\u2014")
+            self.btn_connect.setEnabled(False)
+            self.btn_disconnect.setEnabled(True)
+            self._set_controls_enabled(True)
+            self.btn_stop.setEnabled(False)
+            self._log(f"Device connected successfully (S/N: {sn}).")
+        else:
+            QMessageBox.warning(
+                self, "Connection", "D3S device not found. Check USB connection."
+            )
+
+    def _on_disconnect(self):
+        if self._acquiring:
+            self._on_stop()
+        self.controller.disconnect()
+        self.lbl_status.setText("Disconnected")
+        self.lbl_serial.setText("\u2014")
+        self.btn_connect.setEnabled(True)
+        self.btn_disconnect.setEnabled(False)
+        self._set_controls_enabled(False)
+        self._log("Device disconnected.")
+
+    # ── acquisition slots ────────────────────────────────────────────────────
+    def _on_start(self):
+        if not self.controller.is_connected:
+            return
+        self.controller.start()
+        self._acquiring = True
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._timer.start(100)  # 10 Hz refresh
+        self._log("Acquisition started.")
+
+    def _on_stop(self):
+        self.controller.stop()
+        self._acquiring = False
+        self._timer.stop()
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._log("Acquisition stopped.")
+
+    def _on_clear(self):
+        self.controller.reset()
+        self._log("Spectrum cleared.")
+
+    def _on_save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Spectrum", "", "Text Files (*.txt);;All Files (*)"
+        )
+        if path:
+            spec, elapsed, _ = self.controller.get_spectrum()
+            np.savetxt(path, spec)
+            self._log(f"Spectrum ({elapsed:.1f}s) saved to {path}")
+
+    def _on_log_scale(self, state):
+        self.ax.set_yscale("log" if state else "linear")
+        self.canvas.draw_idle()
+
+    # ── timed acquisition ────────────────────────────────────────────────────
+    def _on_acquire_fixed(self):
+        duration = self.spin_acq_duration.value()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Acquired Spectrum", "", "Text Files (*.txt);;All Files (*)"
+        )
+        if not path:
+            return
+        self.controller.reset()
+        self._log(f"Acquiring for {duration}s...")
+
+        def _worker():
+            spec, elapsed = self.controller.acquire_spectrum_for_duration(duration, path)
+            self._log(f"Timed acquisition complete ({elapsed:.1f}s). Saved to {path}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── logging ──────────────────────────────────────────────────────────────
+    def _on_start_logging(self):
+        interval = self.spin_log_interval.value()
+        total = self.spin_log_total.value()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Log Base Filename", "", "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path:
+            return
+        self.controller.reset()
+        self.controller.start_periodic_logging(path, interval, total)
+        self._log(f"Logging started ({interval}s interval)")
+
+    def _on_stop_logging(self):
+        self.controller.stop_periodic_logging()
+        self._log("Logging stopped.")
+
+    # ── device info slots ────────────────────────────────────────────────────
+    def _on_read_temp(self):
+        temp = self.controller.read_temperature()
+        if np.isnan(temp):
+            self._log("Failed to read temperature.")
+        else:
+            self.lbl_device_temp.setText(f"{temp:.0f} \u00b0C")
+            self._log(f"Temperature = {temp:.0f} \u00b0C")
+
+    # ── periodic refresh ─────────────────────────────────────────────────────
+    def _refresh(self):
+        if not self._acquiring:
+            return
+        spec, elapsed, cps = self.controller.get_spectrum()
+        total_counts = int(spec.sum())
+        neutrons = self.controller.neutron_count
+
+        # Update info labels
+        self.lbl_counts.setText(f"Counts: {total_counts}")
+        self.lbl_cps.setText(f"CPS: {cps:.1f}")
+        self.lbl_neutrons.setText(f"Neutrons: {neutrons}")
+        self.lbl_elapsed.setText(f"Time: {elapsed:.1f} s")
+
+        # Update delta_t in status bar if logging active
+        delta_t = self.controller.last_delta_t
+        if delta_t is not None:
+            self.statusBar().showMessage(
+                f"Elapsed: {elapsed:.1f}s | CPS: {cps:.1f} | \u0394t: {delta_t:.2f}s"
+            )
+        else:
+            self.statusBar().showMessage(f"Elapsed: {elapsed:.1f}s | CPS: {cps:.1f}")
+
+        # Update plot
+        channels = np.arange(len(spec))
+        if self._cal_applied and self._cal_poly is not None:
+            x = self._cal_poly(channels)
+        else:
+            x = channels.astype(float)
+
+        if self._line is None:
+            self._line, = self.ax.plot(x, spec, linewidth=0.8)
+            self.ax.set_xlim(x.min(), x.max())
+        else:
+            self._line.set_xdata(x)
+            self._line.set_ydata(spec)
+            self.ax.set_xlim(x.min(), x.max())
+
+        ymax = max(spec.max(), 1)
+        if self.chk_log_scale.isChecked():
+            self.ax.set_ylim(0.5, ymax * 2)
+        else:
+            self.ax.set_ylim(0, ymax * 1.1)
+
+        # Refresh marker positions
+        self._update_marker_lines()
+
+        self.canvas.draw_idle()
+
+    # ── cleanup ──────────────────────────────────────────────────────────────
+    def closeEvent(self, event):
+        if self._acquiring:
+            self._on_stop()
+        self.controller.disconnect()
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = D3SGUI(root)
-    root.mainloop()
+    main()
