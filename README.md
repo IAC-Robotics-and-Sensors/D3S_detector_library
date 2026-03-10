@@ -5,6 +5,7 @@ A Python interface for collecting gamma-ray spectra from **Kromek D3S** radiatio
 This project provides:
 - A **thread-safe controller class (`D3SController`)** for data acquisition.
 - A **PyQt6 + Matplotlib GUI (`d3s_gui.py`)** for live monitoring, timed acquisition, periodic logging, and energy calibration.
+- A **Peak ID-integrated GUI (`d3s_peakid_gui.py`)** that adds isotope identification from the shared `peakID` library.
 - Example scripts for programmatic use.
 
 ---
@@ -33,6 +34,7 @@ This project provides:
 .
 ├── d3s_controller.py      # Main threaded detector controller
 ├── d3s_gui.py             # PyQt6 GUI with live spectrum & calibration
+├── d3s_peakid_gui.py      # GUI with integrated Peak ID settings + isotope guesses
 ├── d3sLibrary.py          # Legacy multiprocessing-based D3S library
 ├── example_acquisition.py # Example script for timed/periodic runs
 ├── requirements.txt       # Python dependencies
@@ -62,6 +64,23 @@ Run the live graphical interface:
 ```bash
 python d3s_gui.py
 ```
+
+### Peak ID GUI
+
+Run the integrated GUI with isotope identification:
+
+```bash
+python d3s_peakid_gui.py
+```
+
+This GUI keeps all `d3s_gui.py` functionality and adds:
+- An **Identify Peaks** button on the **Spectrum** tab.
+- A **Peak Identification** table under the spectrum showing isotope guesses and fit statistics.
+- A **Peak ID Settings** tab for runtime control of peak-finding and isotope-ID parameters.
+
+Notes:
+- The Peak ID workflow uses the shared `../peakID/main.py` pipeline.
+- If no peaks are found, the run ends gracefully and **Identify Peaks** is available again.
 
 **Tabs and features:**
 
